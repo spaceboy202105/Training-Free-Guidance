@@ -6,15 +6,9 @@ from torchvision import transforms
 from datasets import load_from_disk, load_dataset
 from diffusers import StableDiffusionPipeline
 from functools import partial
+from .wireframe_guidance import TangentPointEnergyGuidance
 import logger
 
-from .image_label_guidance import ImageLabelGuidance
-from .style_transfer_guidance import StyleTransferGuidance
-from .super_resolution import SuperResolution
-from .gaussian_deblur import GaussianDeblur
-from .molecule_properties import MoleculePropertyGuidance
-from .audio_declipping import AduioDeclippingGuidance
-from .audio_inpainting import AduioInpaintingGuidance
 
 class BaseGuider:
 
@@ -53,22 +47,9 @@ class BaseGuider:
 
         for task, guide_network, target in zip(self.args.tasks, self.args.guide_networks, self.args.targets):
 
-            if task == 'style_transfer':
-                guider = StyleTransferGuidance(guide_network, target, device)
-            elif task == 'label_guidance':
-                guider = ImageLabelGuidance(guide_network, target, device, time=False)
-            elif task == 'label_guidance_time':
-                guider = ImageLabelGuidance(guide_network, target, device, time=True)
-            elif task == 'super_resolution':
-                guider = SuperResolution(self.args)
-            elif task == 'gaussian_deblur':
-                guider = GaussianDeblur(self.args)
-            elif task == 'molecule_property':
-                guider = MoleculePropertyGuidance(self.args)
-            elif task == 'audio_declipping':
-                guider = AduioDeclippingGuidance(self.args)
-            elif task == 'audio_inpainting':
-                guider = AduioInpaintingGuidance(self.args)
+            if task == 'TangentPointEnergy':
+                guider = TangentPointEnergyGuidance(guide_network, target, device)
+
             else:
                 raise NotImplementedError
             
