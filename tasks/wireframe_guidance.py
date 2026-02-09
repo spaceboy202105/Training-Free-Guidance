@@ -58,62 +58,91 @@ class TangentPointEnergyGuidance:
             energy: A scalar tensor representing the intersection penalty.
                    Higher energy means more intersections.
         """
+        # NOTE: keep public API; delegate to vectorized implementation
+        return self.compute_intersection_energy_vectorized(x, loop_mask=loop_mask, point_mask=point_mask)
+
+    def compute_intersection_energy_vectorized(self, x: torch.Tensor, loop_mask=None, point_mask=None) -> torch.Tensor:
+        """
+        Vectorized TPE energy over all valid loops (removes Python loops over batch/loops).
+
+        x: [B, L, P, 3]
+        loop_mask: [B, L] bool
+        point_mask: [B, L, P] bool
+        """
         if loop_mask is None:
             loop_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         if point_mask is None:
             point_mask = torch.ones(x.shape[:3], dtype=torch.bool, device=x.device)
+
         eps = self.tpe_eps
         beta = self.tpe_beta
         eta = self.tpe_eta
 
-        total_energy = x.new_zeros(())
-        batch_size, max_loops, max_points, _ = x.shape
+        B, L, P, _ = x.shape
 
-        for b in range(batch_size):
-            for l in range(max_loops):
-                if not loop_mask[b, l]:
-                    continue
+        # Select valid (b,l) loops
+        bl = loop_mask.view(-1)  # [B*L]
+        if bl.sum() == 0:
+            return x.new_zeros(())
 
-                valid_mask = point_mask[b, l]
-                if valid_mask.sum() < 4:
-                    continue
+        X = x.view(B * L, P, 3)[bl]                 # [N, P, 3]
+        PM = point_mask.view(B * L, P)[bl]          # [N, P]
+        N = X.shape[0]
 
-                points = x[b, l][valid_mask]
-                num_points = points.shape[0]
-                if num_points < 4:
-                    continue
+        # If too few valid points in a loop, it contributes 0
+        valid_counts = PM.sum(dim=1)                # [N]
+        valid_loop = valid_counts >= 4
+        if valid_loop.sum() == 0:
+            return x.new_zeros(())
 
-                points_next = torch.roll(points, shifts=-1, dims=0)
-                edge_vec = points_next - points
-                edge_len = torch.linalg.norm(edge_vec, dim=-1).clamp_min(eps)
-                edge_tangent = edge_vec / edge_len.unsqueeze(-1)
+        X = X[valid_loop]
+        PM = PM[valid_loop]
+        N = X.shape[0]
 
-                if num_points < 4:
-                    continue
+        # Zero-out invalid points (keeps tensor dense for vectorization)
+        X = X * PM.unsqueeze(-1).to(X.dtype)
 
-                endpoints_i = torch.stack([points, points_next], dim=1)  # [E, 2, 3]
-                endpoints_j = endpoints_i
+        # Edges: i -> i+1 (cyclic)
+        X_next = torch.roll(X, shifts=-1, dims=1)   # [N, P, 3]
+        edge_vec = X_next - X                       # [N, P, 3]
+        edge_len = torch.linalg.norm(edge_vec, dim=-1).clamp_min(eps)  # [N, P]
+        edge_tangent = edge_vec / edge_len.unsqueeze(-1)               # [N, P, 3]
 
-                d = endpoints_i[:, None, :, None, :] - endpoints_j[None, :, None, :, :]
-                dist = torch.linalg.norm(d, dim=-1).clamp_min(eps)
+        # Valid edge if both endpoints valid
+        edge_valid = PM & torch.roll(PM, shifts=-1, dims=1)            # [N, P]
+        edge_len = edge_len * edge_valid.to(edge_len.dtype)           # mask out invalid edges
 
-                tangent = edge_tangent[:, None, None, None, :]
-                cross = torch.cross(tangent.expand_as(d), d, dim=-1)
-                cross_norm = torch.linalg.norm(cross, dim=-1).clamp_min(eps)
+        # Build pairwise segment endpoint diffs:
+        # endpoints_i: [N, P, 2, 3] with [start, end]
+        endpoints_i = torch.stack([X, X_next], dim=2)                  # [N, P, 2, 3]
+        endpoints_j = endpoints_i
 
-                kernel = (cross_norm ** beta) / (dist ** eta)
-                kernel_avg = kernel.mean(dim=(-1, -2))
+        # d: [N, P, P, 2, 2, 3] (broadcast)
+        d = endpoints_i[:, :, None, :, None, :] - endpoints_j[:, None, :, None, :, :]
 
-                idx = torch.arange(num_points, device=x.device)
-                diff = (idx[:, None] - idx[None, :]).abs()
-                adjacent = (diff == 0) | (diff == 1) | (diff == num_points - 1)
+        dist = torch.linalg.norm(d, dim=-1).clamp_min(eps)             # [N, P, P, 2, 2]
 
-                pair_mask = ~adjacent
-                length_weight = edge_len[:, None] * edge_len[None, :]
-                energy = (kernel_avg * length_weight * pair_mask).sum()
-                total_energy = total_energy + energy
+        tangent = edge_tangent[:, :, None, None, None, :]              # [N, P, 1, 1, 1, 3]
+        cross = torch.cross(tangent.expand_as(d), d, dim=-1)
+        cross_norm = torch.linalg.norm(cross, dim=-1).clamp_min(eps)   # [N, P, P, 2, 2]
 
-        return total_energy
+        kernel = (cross_norm ** beta) / (dist ** eta)                  # [N, P, P, 2, 2]
+        kernel_avg = kernel.mean(dim=(-1, -2))                         # [N, P, P]
+
+        # Adjacent mask (exclude i==j and neighbors, cyclic)
+        idx = torch.arange(P, device=x.device)
+        diff = (idx[:, None] - idx[None, :]).abs()                     # [P, P]
+        adjacent = (diff == 0) | (diff == 1) | (diff == P - 1)         # [P, P]
+        pair_mask = (~adjacent).to(kernel_avg.dtype)                   # [P, P]
+
+        # Also exclude pairs where either edge is invalid
+        edge_pair_valid = (edge_valid.to(kernel_avg.dtype)[:, :, None] *
+                           edge_valid.to(kernel_avg.dtype)[:, None, :])  # [N, P, P]
+
+        length_weight = edge_len[:, :, None] * edge_len[:, None, :]    # [N, P, P]
+
+        energy = (kernel_avg * length_weight * edge_pair_valid * pair_mask).sum()
+        return energy
 
     @torch.enable_grad()
     def get_guidance(self, x_need_grad, func=lambda x:x, post_process=lambda x:x, return_logp=False, check_grad=True, **kwargs):
@@ -125,14 +154,14 @@ class TangentPointEnergyGuidance:
             check_grad_fn(x_need_grad)
 
         # Apply any necessary transformations (e.g., VAE decoding)
-        x = post_process(func(x_need_grad))
+        x_pnt,loop_mask,point_mask = post_process(func(x_need_grad))
 
         # Calculate energy (loss)
         # We want to minimize energy, so we maximize negative energy (log_prob = -energy)
         energy = self.compute_intersection_energy(
-            x,
-            loop_mask=kwargs.get("loop_mask", None),
-            point_mask=kwargs.get("point_mask", None),
+            x_pnt,
+            loop_mask=loop_mask,
+            point_mask=point_mask,
         )
         log_probs = -energy
 
@@ -152,13 +181,16 @@ class TangentPointEnergyGuidance:
             grad_l2 = grad_l2.masked_fill(fixed_mask.unsqueeze(-1), 0.0)
 
         if self.use_sobolev_gradient:                                                                                                                                                                                                        
-              # 选项 A: 完整分数阶 (根据论文)                                                                                                                                                                                                  
-              A_matrix = self.build_fractional_sobolev_matrix(x)
-              grad_final = torch.linalg.solve(A_matrix, grad_l2)
+              # 选项 A: 完整分数阶 (根据论文)                   
+            grad_final = grad_l2              
+                                                                                                                                                                                             
+            #   A_matrix = self.build_fractional_sobolev_matrix(x)
+            #   grad_final = torch.linalg.solve(A_matrix, grad_l2)
         elif self.use_laplacian_smoothing:
+            grad_final = grad_l2              
               # 选项 B: 简单 Laplacian 平滑 (H1)
-              L_matrix = self.get_laplacian(x)
-              grad_final = torch.linalg.solve(torch.eye(N) + self.lambda * L_matrix, grad_l2)
+            #   L_matrix = self.get_laplacian(x)
+            #   grad_final = torch.linalg.solve(torch.eye(N) + self.lambda * L_matrix, grad_l2)
         else:
               grad_final = grad_l2              
         # Rescale gradient (standard practice in this codebase)
