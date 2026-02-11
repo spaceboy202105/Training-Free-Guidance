@@ -1,7 +1,24 @@
 import torch
 import torch.nn as nn
 from typing import List, Union
-from .utils import check_grad_fn, rescale_grad
+
+try:
+    from .utils import check_grad_fn, rescale_grad
+except Exception:
+    def check_grad_fn(x_need_grad):
+        assert x_need_grad.requires_grad, "x_need_grad should require grad"
+
+    def rescale_grad(grad: torch.Tensor, clip_scale, **kwargs):
+        node_mask = kwargs.get('node_mask', None)
+        scale = (grad ** 2).mean(dim=-1)
+        if node_mask is not None:
+            scale = scale * node_mask.float()
+            denom = node_mask.float().sum(dim=-1).clamp_min(1.0)
+            scale = scale.sum(dim=-1) / denom
+            clipped_scale = torch.clamp(scale, max=clip_scale)
+            coef = clipped_scale / (scale + 1e-12)
+            grad = grad * coef.view(-1, 1, 1)
+        return grad
 
 class TangentPointEnergyGuidance:
     """
@@ -59,9 +76,20 @@ class TangentPointEnergyGuidance:
                    Higher energy means more intersections.
         """
         # NOTE: keep public API; delegate to vectorized implementation
-        return self.compute_intersection_energy_vectorized(x, loop_mask=loop_mask, point_mask=point_mask)
+        return self.compute_intersection_energy_vectorized(
+            x,
+            loop_mask=loop_mask,
+            point_mask=point_mask,
+            return_per_sample=False,
+        )
 
-    def compute_intersection_energy_vectorized(self, x: torch.Tensor, loop_mask=None, point_mask=None) -> torch.Tensor:
+    def compute_intersection_energy_vectorized(
+        self,
+        x: torch.Tensor,
+        loop_mask=None,
+        point_mask=None,
+        return_per_sample: bool = False,
+    ) -> torch.Tensor:
         """
         Vectorized TPE energy over all valid loops (removes Python loops over batch/loops).
 
@@ -83,21 +111,27 @@ class TangentPointEnergyGuidance:
         # Select valid (b,l) loops
         bl = loop_mask.view(-1)  # [B*L]
         if bl.sum() == 0:
+            if return_per_sample:
+                return x.new_zeros((B,))
             return x.new_zeros(())
+
+        flat_indices = torch.nonzero(bl, as_tuple=False).squeeze(-1)  # [N]
+        sample_ids = torch.div(flat_indices, L, rounding_mode='floor')  # [N]
 
         X = x.view(B * L, P, 3)[bl]                 # [N, P, 3]
         PM = point_mask.view(B * L, P)[bl]          # [N, P]
-        N = X.shape[0]
 
         # If too few valid points in a loop, it contributes 0
         valid_counts = PM.sum(dim=1)                # [N]
         valid_loop = valid_counts >= 4
         if valid_loop.sum() == 0:
+            if return_per_sample:
+                return x.new_zeros((B,))
             return x.new_zeros(())
 
         X = X[valid_loop]
         PM = PM[valid_loop]
-        N = X.shape[0]
+        sample_ids = sample_ids[valid_loop]
 
         # Zero-out invalid points (keeps tensor dense for vectorization)
         X = X * PM.unsqueeze(-1).to(X.dtype)
@@ -141,8 +175,13 @@ class TangentPointEnergyGuidance:
 
         length_weight = edge_len[:, :, None] * edge_len[:, None, :]    # [N, P, P]
 
-        energy = (kernel_avg * length_weight * edge_pair_valid * pair_mask).sum()
-        return energy
+        loop_energy = (kernel_avg * length_weight * edge_pair_valid * pair_mask).sum(dim=(1, 2))
+        energy_per_sample = x.new_zeros((B,))
+        energy_per_sample.scatter_add_(0, sample_ids, loop_energy)
+
+        if return_per_sample:
+            return energy_per_sample
+        return energy_per_sample.sum()
 
     @torch.enable_grad()
     def get_guidance(self, x_need_grad, func=lambda x:x, post_process=lambda x:x, return_logp=False, check_grad=True, **kwargs):
@@ -158,10 +197,11 @@ class TangentPointEnergyGuidance:
 
         # Calculate energy (loss)
         # We want to minimize energy, so we maximize negative energy (log_prob = -energy)
-        energy = self.compute_intersection_energy(
+        energy = self.compute_intersection_energy_vectorized(
             x_pnt,
             loop_mask=loop_mask,
             point_mask=point_mask,
+            return_per_sample=True,
         )
         log_probs = -energy
 
@@ -172,13 +212,13 @@ class TangentPointEnergyGuidance:
         # We want to move x in the direction that maximizes log_probs (minimizes energy)
         grad_l2 = torch.autograd.grad(log_probs.sum(), x_need_grad)[0]
 
-        point_mask = kwargs.get("point_mask", None)
-        if point_mask is not None:
-            grad_l2 = grad_l2 * point_mask.unsqueeze(-1).float()
+        point_mask_for_grad = kwargs.get("point_mask", point_mask)
+        if point_mask_for_grad is not None and point_mask_for_grad.shape == grad_l2.shape[:-1]:
+            grad_l2 = grad_l2 * point_mask_for_grad.unsqueeze(-1).float()
 
-        fixed_mask = self._build_fixed_vertex_mask(point_mask)
-        if fixed_mask is not None:
-            grad_l2 = grad_l2.masked_fill(fixed_mask.unsqueeze(-1), 0.0)
+            fixed_mask = self._build_fixed_vertex_mask(point_mask_for_grad)
+            if fixed_mask is not None:
+                grad_l2 = grad_l2.masked_fill(fixed_mask.unsqueeze(-1), 0.0)
 
         if self.use_sobolev_gradient:                                                                                                                                                                                                        
               # 选项 A: 完整分数阶 (根据论文)                   
